@@ -382,8 +382,8 @@ public:
     // (cross-word completions) before fresh schedule traces.
     instr_trace_t* trace = nullptr;
     Word           req_addr = 0;
-    bool           from_refetch = false;
   #ifdef EXT_C_ENABLE
+    bool from_refetch = false;
     {
       auto pick = decompressor_->pick_request(fetch_latch_.empty() ? nullptr
                                                               : fetch_latch_.peek());

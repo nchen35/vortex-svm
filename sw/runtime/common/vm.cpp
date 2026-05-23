@@ -18,6 +18,7 @@
 #include <util.h>
 #include <cassert>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 using namespace vortex;
@@ -395,16 +396,54 @@ void VMManager::write_pte(uint64_t addr, uint64_t value) {
 }
 
 uint64_t VMManager::read_pte(uint64_t addr) {
-  uint8_t* dest = new uint8_t[PTE_SIZE];
-#ifdef XLEN_32
-  uint64_t mask = 0x00000000FFFFFFFFULL;
-#else
-  uint64_t mask = 0xFFFFFFFFFFFFFFFFULL;
-#endif
-  ram_->read(dest, addr, PTE_SIZE);
-  uint64_t ret = (*(uint64_t*)dest) & mask;
-  delete[] dest;
+  uint8_t buf[sizeof(uint64_t)] = {};
+  ram_->read(buf, addr, PTE_SIZE);
+  uint64_t ret = 0;
+  std::memcpy(&ret, buf, PTE_SIZE);
   return ret;
+}
+
+int VMManager::free_va_mapping(uint64_t va, uint64_t size) {
+  if (!need_trans(va))
+    return 0;
+
+  uint64_t asize = aligned_size(size, MEM_PAGE_SIZE);
+  uint64_t num_pages = asize >> MEM_PAGE_LOG2_SIZE;
+  uint64_t base_vpn = va >> MEM_PAGE_LOG2_SIZE;
+
+  for (uint64_t i = 0; i < num_pages; ++i) {
+    uint64_t vpn = base_vpn + i;
+    // Walk the page table to find the leaf PTE address, then zero it.
+    vAddr_t vaddr((vpn << MEM_PAGE_LOG2_SIZE));
+    uint64_t cur_ppn = get_base_ppn();
+    int level = (int)PT_LEVEL - 1;
+    while (level >= 0) {
+      uint64_t pte_addr_val = (cur_ppn * PT_SIZE) + (vaddr.vpn[level] * PTE_SIZE);
+      uint64_t pte_bytes = read_pte(pte_addr_val);
+      PTE_t pte(pte_bytes);
+      if (!pte.v)
+        break; // already invalid
+      bool is_leaf = (pte.r != 0) || (pte.w != 0) || (pte.x != 0);
+      if (is_leaf) {
+        write_pte(pte_addr_val, 0); // V=0 → invalid
+        // Remove from ppn→vpn mapping (reverse lookup).
+        for (auto it = addr_mapping.begin(); it != addr_mapping.end(); ) {
+          if (it->second == vpn) {
+            it = addr_mapping.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        break;
+      }
+      cur_ppn = pte.ppn;
+      --level;
+    }
+  }
+
+  // Release the VA range back to the virtual address allocator.
+  virtual_mem_->release(va);
+  return 0;
 }
 
 // get_base_ppn() and get_mode() are inline accessors in the header.

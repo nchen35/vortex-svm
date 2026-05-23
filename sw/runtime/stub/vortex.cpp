@@ -166,3 +166,23 @@ extern int vx_dcr_write(vx_device_h hdevice, uint32_t addr, uint32_t value) {
 extern int vx_dcr_read(vx_device_h hdevice, uint32_t addr, uint32_t tag, uint32_t* value) {
   return (g_callbacks.dcr_read)(hdevice, addr, tag, value);
 }
+
+extern int vx_svm_alloc(vx_device_h hdevice, uint64_t size, int flags, void** host_ptr) {
+  return (g_callbacks.svm_alloc)(hdevice, size, flags, host_ptr);
+}
+
+extern int vx_svm_free(vx_device_h hdevice, void* host_ptr) {
+  return (g_callbacks.svm_free)(hdevice, host_ptr);
+}
+
+extern int vx_svm_map(vx_device_h hdevice, void* host_ptr, uint64_t size, int flags) {
+  return (g_callbacks.svm_map)(hdevice, host_ptr, size, flags);
+}
+
+extern int vx_svm_unmap(vx_device_h hdevice, void* host_ptr, uint64_t size) {
+  return (g_callbacks.svm_unmap)(hdevice, host_ptr, size);
+}
+
+extern uint64_t vx_svm_dev_addr(vx_device_h hdevice, void* host_ptr) {
+  return (g_callbacks.svm_dev_addr)(hdevice, host_ptr);
+}

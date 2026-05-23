@@ -223,5 +223,34 @@ extern int vx_dev_init(callbacks_t* callbacks) {
     return device->dcr_write(addr, value);
   };
 
+  callbacks->svm_alloc = [](vx_device_h hdevice, uint64_t size, int flags, void** host_ptr)->int {
+    if (nullptr == hdevice || nullptr == host_ptr) return -1;
+    DBGPRINT("SVM_ALLOC: hdevice=%p, size=%ld, flags=0x%x\n", hdevice, size, flags);
+    return ((vx_device*)hdevice)->svm_alloc(size, flags, host_ptr);
+  };
+
+  callbacks->svm_free = [](vx_device_h hdevice, void* host_ptr)->int {
+    if (nullptr == hdevice) return -1;
+    DBGPRINT("SVM_FREE: hdevice=%p, host_ptr=%p\n", hdevice, host_ptr);
+    return ((vx_device*)hdevice)->svm_free(host_ptr);
+  };
+
+  callbacks->svm_map = [](vx_device_h hdevice, void* host_ptr, uint64_t size, int flags)->int {
+    if (nullptr == hdevice) return -1;
+    DBGPRINT("SVM_MAP: hdevice=%p, host_ptr=%p, size=%ld, flags=0x%x\n", hdevice, host_ptr, size, flags);
+    return ((vx_device*)hdevice)->svm_map(host_ptr, size, flags);
+  };
+
+  callbacks->svm_unmap = [](vx_device_h hdevice, void* host_ptr, uint64_t size)->int {
+    if (nullptr == hdevice) return -1;
+    DBGPRINT("SVM_UNMAP: hdevice=%p, host_ptr=%p, size=%ld\n", hdevice, host_ptr, size);
+    return ((vx_device*)hdevice)->svm_unmap(host_ptr, size);
+  };
+
+  callbacks->svm_dev_addr = [](vx_device_h hdevice, void* host_ptr)->uint64_t {
+    if (nullptr == hdevice) return 0;
+    return ((vx_device*)hdevice)->svm_dev_addr(host_ptr);
+  };
+
   return 0;
 }

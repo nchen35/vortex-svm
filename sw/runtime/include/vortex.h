@@ -131,6 +131,30 @@ int vx_dcr_read(vx_device_h hdevice, uint32_t addr, uint32_t tag, uint32_t* valu
 // query device performance counter
 int vx_mpm_query(vx_device_h hdevice, uint32_t mpm_class, uint32_t addr, uint32_t core_id, uint64_t* value);
 
+////////////////////////////// SVM API (coarse-grained buffer SVM) ////////////
+
+// Allocate a Shared Virtual Memory buffer.
+// *host_ptr receives a usable C++ host pointer to the buffer.
+// Use vx_svm_dev_addr() to obtain the device-side VA for kernel arguments.
+int vx_svm_alloc(vx_device_h hdevice, uint64_t size, int flags, void** host_ptr);
+
+// Release an SVM buffer previously allocated with vx_svm_alloc.
+int vx_svm_free(vx_device_h hdevice, void* host_ptr);
+
+// Transfer ownership to the host (coarse-grained map).
+// For VX_MEM_READ: flushes device caches and copies device RAM into the host buffer.
+// For VX_MEM_WRITE: no copy (host will overwrite); marks host as owner.
+// After this call, the host may read/write *host_ptr directly.
+int vx_svm_map(vx_device_h hdevice, void* host_ptr, uint64_t size, int flags);
+
+// Transfer ownership back to the device (coarse-grained unmap).
+// Copies the host buffer into device RAM so the device sees the latest data.
+int vx_svm_unmap(vx_device_h hdevice, void* host_ptr, uint64_t size);
+
+// Return the device VA corresponding to a host SVM pointer.
+// Simx-specific helper: on real hardware (uint64_t)host_ptr IS the device VA.
+uint64_t vx_svm_dev_addr(vx_device_h hdevice, void* host_ptr);
+
 ////////////////////////////// UTILITY FUNCTIONS //////////////////////////////
 
 // upload bytes to device

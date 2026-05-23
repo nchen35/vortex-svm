@@ -26,9 +26,11 @@
 #include <chrono>
 #include <future>
 #include <iostream>
+#include <new>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unordered_map>
 
 #include <VX_config.h>
 
@@ -47,6 +49,20 @@ public:
       future_.wait();
     }
   }
+
+  // ------------------------------------------------------------------
+  // SVM region bookkeeping (coarse-grained buffer SVM)
+  // ------------------------------------------------------------------
+
+  // One record per vx_svm_alloc call, keyed by the host buffer pointer.
+  struct svm_region_t {
+    uint64_t va;       // device-side virtual address (minted by VMManager)
+    uint64_t pa;       // device-side physical address (in global_mem_)
+    uint64_t size;     // user-requested size (not page-aligned)
+    uint8_t* host_buf; // host-side copy buffer (malloc'd); equals key
+  };
+
+  std::unordered_map<void*, svm_region_t> svm_regions_;
 
   int init() {
 #ifdef VM_ENABLE
@@ -291,6 +307,123 @@ public:
     return processor_.dcr_read(addr, tag, value);
   }
 
+  // ---- SVM methods (coarse-grained buffer SVM) ----
+
+  int svm_alloc(uint64_t size, int flags, void** out_host_ptr) {
+    uint64_t asize = aligned_size(size, MEM_PAGE_SIZE);
+    uint64_t pa = 0;
+
+    // Allocate device physical memory.
+    CHECK_ERR(global_mem_.allocate(asize, &pa), { return err; });
+    CHECK_ERR(this->mem_access(pa, asize, flags), {
+      global_mem_.release(pa);
+      return err;
+    });
+
+    // In VM mode, mint a device VA and install PTEs.
+    // In non-VM mode, va == pa (identity mapping; no TLB involved).
+    uint64_t va = pa;
+#ifdef VM_ENABLE
+    CHECK_ERR(vm_mgr_->phy_to_virt_map(asize, &va, flags), {
+      global_mem_.release(pa);
+      return err;
+    });
+#endif
+
+    // Allocate the host-side copy buffer (used by svm_map / svm_unmap).
+    uint8_t* host_buf = new (std::nothrow) uint8_t[size]();
+    if (!host_buf) {
+#ifdef VM_ENABLE
+      vm_mgr_->free_va_mapping(va, asize);
+#endif
+      global_mem_.release(pa);
+      return -1;
+    }
+
+    svm_regions_[host_buf] = svm_region_t{va, pa, size, host_buf};
+    *out_host_ptr = host_buf;
+    DBGPRINT("[SVM] svm_alloc: size=0x%lx va=0x%lx pa=0x%lx host_buf=%p\n",
+             size, va, pa, (void*)host_buf);
+    return 0;
+  }
+
+  int svm_free(void* host_ptr) {
+    auto it = svm_regions_.find(host_ptr);
+    if (it == svm_regions_.end()) {
+      std::cerr << "[SVM] svm_free: unknown pointer " << host_ptr << std::endl;
+      return -1;
+    }
+    auto& r = it->second;
+    uint64_t asize = aligned_size(r.size, MEM_PAGE_SIZE);
+
+#ifdef VM_ENABLE
+    vm_mgr_->free_va_mapping(r.va, asize);
+#endif
+    this->mem_access(r.pa, asize, 0);
+    global_mem_.release(r.pa);
+    delete[] r.host_buf;
+    svm_regions_.erase(it);
+    DBGPRINT("[SVM] svm_free: host_buf=%p\n", host_ptr);
+    return 0;
+  }
+
+  // Transfer ownership to host. For READ access, flush caches and copy
+  // device RAM → host buffer. For WRITE access, no copy (host will overwrite).
+  int svm_map(void* host_ptr, uint64_t size, int flags) {
+    auto it = svm_regions_.find(host_ptr);
+    if (it == svm_regions_.end()) {
+      std::cerr << "[SVM] svm_map: unknown pointer " << host_ptr << std::endl;
+      return -1;
+    }
+    auto& r = it->second;
+    if (size > r.size) size = r.size;
+
+    if (flags & VX_MEM_READ) {
+      // Flush all device caches so we read back the most recent data.
+      {
+        uint32_t dummy;
+        for (uint32_t cid = 0; cid < NUM_CORES * NUM_CLUSTERS; ++cid) {
+          this->dcr_read(VX_DCR_BASE_CACHE_FLUSH, cid, &dummy);
+        }
+      }
+      // Copy device RAM at PA into host buffer.
+      ram_.enable_acl(false);
+      ram_.read(r.host_buf, r.pa, size);
+      ram_.enable_acl(true);
+    }
+    // For WRITE-only, the host will overwrite; no copy needed.
+    DBGPRINT("[SVM] svm_map: host_buf=%p size=0x%lx flags=0x%x\n",
+             host_ptr, size, flags);
+    return 0;
+  }
+
+  // Transfer ownership to device: copy host buffer → device RAM at PA.
+  int svm_unmap(void* host_ptr, uint64_t size) {
+    auto it = svm_regions_.find(host_ptr);
+    if (it == svm_regions_.end()) {
+      std::cerr << "[SVM] svm_unmap: unknown pointer " << host_ptr << std::endl;
+      return -1;
+    }
+    auto& r = it->second;
+    if (size > r.size) size = r.size;
+
+    ram_.enable_acl(false);
+    ram_.write(r.host_buf, r.pa, size);
+    ram_.enable_acl(true);
+    DBGPRINT("[SVM] svm_unmap: host_buf=%p pa=0x%lx size=0x%lx\n",
+             host_ptr, r.pa, size);
+    return 0;
+  }
+
+  uint64_t svm_dev_addr(void* host_ptr) {
+    auto it = svm_regions_.find(host_ptr);
+    if (it == svm_regions_.end()) {
+      std::cerr << "[SVM] svm_dev_addr: unknown pointer " << host_ptr << std::endl;
+      return 0;
+    }
+    return it->second.va;
+  }
+
 private:
   RAM ram_;
   Processor processor_;
@@ -302,3 +435,39 @@ private:
 };
 
 #include <callbacks.inc>
+
+// SVM C API entry points (not dispatched through callbacks — called directly).
+extern "C" {
+
+int vx_svm_alloc(vx_device_h hdevice, uint64_t size, int flags, void** host_ptr) {
+  if (!hdevice || !host_ptr || size == 0) return -1;
+  DBGPRINT("VX_SVM_ALLOC: hdevice=%p size=%lu flags=0x%x\n", hdevice, size, flags);
+  return ((vx_device*)hdevice)->svm_alloc(size, flags, host_ptr);
+}
+
+int vx_svm_free(vx_device_h hdevice, void* host_ptr) {
+  if (!hdevice || !host_ptr) return -1;
+  DBGPRINT("VX_SVM_FREE: hdevice=%p host_ptr=%p\n", hdevice, host_ptr);
+  return ((vx_device*)hdevice)->svm_free(host_ptr);
+}
+
+int vx_svm_map(vx_device_h hdevice, void* host_ptr, uint64_t size, int flags) {
+  if (!hdevice || !host_ptr || size == 0) return -1;
+  DBGPRINT("VX_SVM_MAP: hdevice=%p host_ptr=%p size=%lu flags=0x%x\n",
+           hdevice, host_ptr, size, flags);
+  return ((vx_device*)hdevice)->svm_map(host_ptr, size, flags);
+}
+
+int vx_svm_unmap(vx_device_h hdevice, void* host_ptr, uint64_t size) {
+  if (!hdevice || !host_ptr || size == 0) return -1;
+  DBGPRINT("VX_SVM_UNMAP: hdevice=%p host_ptr=%p size=%lu\n",
+           hdevice, host_ptr, size);
+  return ((vx_device*)hdevice)->svm_unmap(host_ptr, size);
+}
+
+uint64_t vx_svm_dev_addr(vx_device_h hdevice, void* host_ptr) {
+  if (!hdevice || !host_ptr) return 0;
+  return ((vx_device*)hdevice)->svm_dev_addr(host_ptr);
+}
+
+} // extern "C"

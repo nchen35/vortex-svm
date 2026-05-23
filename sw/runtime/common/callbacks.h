@@ -69,6 +69,21 @@ typedef struct {
   // read device configuration registers
   int (*dcr_read) (vx_device_h hdevice, uint32_t addr, uint32_t tag, uint32_t* value);
 
+  // SVM: allocate shared virtual memory buffer
+  int (*svm_alloc) (vx_device_h hdevice, uint64_t size, int flags, void** host_ptr);
+
+  // SVM: free shared virtual memory buffer
+  int (*svm_free) (vx_device_h hdevice, void* host_ptr);
+
+  // SVM: transfer ownership to host (device→host copy)
+  int (*svm_map) (vx_device_h hdevice, void* host_ptr, uint64_t size, int flags);
+
+  // SVM: transfer ownership to device (host→device copy)
+  int (*svm_unmap) (vx_device_h hdevice, void* host_ptr, uint64_t size);
+
+  // SVM: return device virtual address for a host pointer
+  uint64_t (*svm_dev_addr) (vx_device_h hdevice, void* host_ptr);
+
 } callbacks_t;
 
 int vx_dev_init(callbacks_t* callbacks);

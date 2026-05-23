@@ -55,6 +55,11 @@ public:
   // not later mint colliding VAs.
   int install_identity_map(uint64_t addr, uint64_t size);
 
+  // Remove the VA→PA mapping for [va, va + size). Zeros leaf PTEs, releases
+  // the VA range back to the VA allocator, and removes addr_mapping entries.
+  // Does NOT release the physical pages (caller is responsible for that).
+  int free_va_mapping(uint64_t va, uint64_t size);
+
 private:
   int init_page_table(uint64_t addr, uint64_t size);
   uint8_t alloc_page_table(uint64_t* pt_addr);
