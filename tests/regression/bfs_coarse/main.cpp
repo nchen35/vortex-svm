@@ -126,7 +126,9 @@ int main(int argc, char** argv) {
   RT_CHECK(vx_svm_unmap(device, nbrs_svm,  nbrs_bytes));
 
   // ── BFS level loop (coarse: explicit map/unmap of the flag each level) ────
-  uint32_t grid_dim[1]  = {1};
+  // Launch multiple thread blocks (see bfs_fine for rationale).
+  uint32_t num_blocks   = (num_nodes + block_size - 1) / block_size;
+  uint32_t grid_dim[1]  = {num_blocks};
   uint32_t block_dim[1] = {block_size};
 
   int32_t level = 0;

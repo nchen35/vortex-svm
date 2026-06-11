@@ -19,6 +19,8 @@
 #include <sstream>
 #include <unordered_map>
 #include <cstring>
+#include <cstdlib>
+#include <iostream>
 
 #include "scheduler.h"
 #include "decode.h"
@@ -773,6 +775,25 @@ public:
     return operands_.at(0)->get_exit_code();
   }
 
+#ifdef VM_ENABLE
+  // Print this core's data-TLB counters when VORTEX_TLB_STATS is set in the
+  // environment. Used to quantify the address-translation cost of SVM
+  // pointer-chasing workloads (TLB misses -> hardware page walks).
+  void print_tlb_stats() {
+    if (!std::getenv("VORTEX_TLB_STATS"))
+      return;
+    uint64_t reads  = dcache_mmu_->tlb_reads();
+    uint64_t hits   = dcache_mmu_->tlb_hits();
+    uint64_t misses = dcache_mmu_->tlb_misses();
+    uint64_t evicts = dcache_mmu_->tlb_evictions();
+    double   rate   = reads ? (100.0 * (double)hits / (double)reads) : 0.0;
+    std::cout << "TLB[dcache]: reads=" << reads
+              << " hits=" << hits << " misses=" << misses
+              << " evictions=" << evicts
+              << " hit_rate=" << rate << "%" << std::endl;
+  }
+#endif
+
   // DTM debug-only accessors. The simx debug stack (sim/simx/dtm/) reads
   // and writes warp PC and integer registers directly; in v3 those live
   // in Scheduler and Operands respectively. Single-hart debug uses lane=0.
@@ -887,6 +908,9 @@ Core::Core(const SimContext& ctx,
 {}
 
 Core::~Core() {
+#ifdef VM_ENABLE
+  impl_->print_tlb_stats();
+#endif
   delete impl_;
 }
 

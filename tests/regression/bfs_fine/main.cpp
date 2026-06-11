@@ -129,8 +129,11 @@ int main(int argc, char** argv) {
   }
 
   // ── BFS level loop (fine-grained: direct flag access, no map/unmap) ────────
+  // Launch multiple thread blocks so the per-node work spreads across CTAs (and
+  // cores, on a multi-core build). The grid-stride kernel covers any geometry.
   int32_t* flag = reinterpret_cast<int32_t*>(flag_svm);
-  uint32_t grid_dim[1]  = {1};            // one CTA -> one core
+  uint32_t num_blocks   = (num_nodes + block_size - 1) / block_size;
+  uint32_t grid_dim[1]  = {num_blocks};
   uint32_t block_dim[1] = {block_size};
 
   int32_t level = 0;
