@@ -51,7 +51,7 @@ public:
   }
 
   // ------------------------------------------------------------------
-  // SVM region bookkeeping (coarse-grained buffer SVM)
+  // SVM region bookkeeping (buffer SVM: coarse + fine grained)
   // ------------------------------------------------------------------
 
   // One record per vx_svm_alloc call, keyed by the host buffer pointer.
@@ -60,6 +60,7 @@ public:
     uint64_t pa;       // device-side physical address (in global_mem_)
     uint64_t size;     // user-requested size (not page-aligned)
     uint8_t* host_buf; // host-side copy buffer (malloc'd); equals key
+    bool     fine;     // fine-grained: auto-sync at kernel boundaries, no map/unmap
   };
 
   std::unordered_map<void*, svm_region_t> svm_regions_;
@@ -272,6 +273,9 @@ public:
   }
 
   int start() {
+    // Fine-grained SVM: push the host's latest writes to device RAM before the
+    // kernel runs (implicit unmap at the launch boundary).
+    sync_fine_to_device();
     // DCRs already written by stub; just trigger execution
     future_ = std::async(std::launch::async, [&] { processor_.run(); });
     return 0;
@@ -290,6 +294,9 @@ public:
       if (0 == timeout_sec--)
         return -1;
     }
+    // Fine-grained SVM: refresh the host view now that the kernel has completed
+    // (implicit map READ at the completion boundary).
+    sync_fine_to_host();
     return 0;
   }
 
@@ -310,12 +317,17 @@ public:
   // ---- SVM methods (coarse-grained buffer SVM) ----
 
   int svm_alloc(uint64_t size, int flags, void** out_host_ptr) {
+    // Split the fine-grained request bit out of the access flags; the memory
+    // permission machinery only understands VX_MEM_READ/WRITE.
+    bool fine = (flags & VX_SVM_FINE_GRAINED) != 0;
+    int mflags = flags & ~VX_SVM_FINE_GRAINED;
+
     uint64_t asize = aligned_size(size, MEM_PAGE_SIZE);
     uint64_t pa = 0;
 
     // Allocate device physical memory.
     CHECK_ERR(global_mem_.allocate(asize, &pa), { return err; });
-    CHECK_ERR(this->mem_access(pa, asize, flags), {
+    CHECK_ERR(this->mem_access(pa, asize, mflags), {
       global_mem_.release(pa);
       return err;
     });
@@ -324,13 +336,14 @@ public:
     // In non-VM mode, va == pa (identity mapping; no TLB involved).
     uint64_t va = pa;
 #ifdef VM_ENABLE
-    CHECK_ERR(vm_mgr_->phy_to_virt_map(asize, &va, flags), {
+    CHECK_ERR(vm_mgr_->phy_to_virt_map(asize, &va, mflags), {
       global_mem_.release(pa);
       return err;
     });
 #endif
 
-    // Allocate the host-side copy buffer (used by svm_map / svm_unmap).
+    // Allocate the host-side copy buffer (used by svm_map / svm_unmap, and by
+    // the implicit fine-grained sync at kernel boundaries).
     uint8_t* host_buf = new (std::nothrow) uint8_t[size]();
     if (!host_buf) {
 #ifdef VM_ENABLE
@@ -340,10 +353,10 @@ public:
       return -1;
     }
 
-    svm_regions_[host_buf] = svm_region_t{va, pa, size, host_buf};
+    svm_regions_[host_buf] = svm_region_t{va, pa, size, host_buf, fine};
     *out_host_ptr = host_buf;
-    DBGPRINT("[SVM] svm_alloc: size=0x%lx va=0x%lx pa=0x%lx host_buf=%p\n",
-             size, va, pa, (void*)host_buf);
+    DBGPRINT("[SVM] svm_alloc: size=0x%lx va=0x%lx pa=0x%lx host_buf=%p fine=%d\n",
+             size, va, pa, (void*)host_buf, (int)fine);
     return 0;
   }
 
@@ -378,6 +391,11 @@ public:
     auto& r = it->second;
     if (size > r.size) size = r.size;
 
+    // Fine-grained buffers are kept coherent automatically at kernel boundaries;
+    // map is a no-op. (The host may access host_buf directly at any time.)
+    if (r.fine)
+      return 0;
+
     if (flags & VX_MEM_READ) {
       // Flush all device caches so we read back the most recent data.
       {
@@ -407,6 +425,10 @@ public:
     auto& r = it->second;
     if (size > r.size) size = r.size;
 
+    // Fine-grained buffers sync automatically at the next kernel launch; no-op.
+    if (r.fine)
+      return 0;
+
     ram_.enable_acl(false);
     ram_.write(r.host_buf, r.pa, size);
     ram_.enable_acl(true);
@@ -422,6 +444,60 @@ public:
       return 0;
     }
     return it->second.va;
+  }
+
+  // ---- fine-grained auto-sync (kernel-boundary coherence) ----
+
+  // Push every fine-grained host buffer into device RAM. Called at kernel launch
+  // so the device sees the host's latest writes (implicit unmap).
+  void sync_fine_to_device() {
+    bool any = false;
+    for (auto& kv : svm_regions_) {
+      auto& r = kv.second;
+      if (!r.fine) continue;
+      ram_.enable_acl(false);
+      ram_.write(r.host_buf, r.pa, r.size);
+      ram_.enable_acl(true);
+      any = true;
+    }
+    if (any)
+      DBGPRINT("[SVM] sync_fine_to_device: pushed host buffers to device\n");
+  }
+
+  // Pull every fine-grained host buffer back from device RAM. Called after the
+  // kernel completes so the host sees the device's latest writes (implicit map
+  // READ). Flushes device caches once so written-back data is in RAM.
+  void sync_fine_to_host() {
+    bool any = false;
+    for (auto& kv : svm_regions_) {
+      if (kv.second.fine) { any = true; break; }
+    }
+    if (!any)
+      return;
+    {
+      uint32_t dummy;
+      for (uint32_t cid = 0; cid < NUM_CORES * NUM_CLUSTERS; ++cid) {
+        this->dcr_read(VX_DCR_BASE_CACHE_FLUSH, cid, &dummy);
+      }
+    }
+    for (auto& kv : svm_regions_) {
+      auto& r = kv.second;
+      if (!r.fine) continue;
+      ram_.enable_acl(false);
+      ram_.read(r.host_buf, r.pa, r.size);
+      ram_.enable_acl(true);
+    }
+    DBGPRINT("[SVM] sync_fine_to_host: refreshed host buffers from device\n");
+  }
+
+  // Explicit host-side coherence point: wait for any in-flight kernel, then
+  // refresh the host view of all fine-grained buffers. Optional — kernel
+  // boundaries already establish coherence (see start()/ready_wait()).
+  int svm_fence() {
+    if (future_.valid())
+      future_.wait();
+    sync_fine_to_host();
+    return 0;
   }
 
 private:
@@ -468,6 +544,12 @@ int vx_svm_unmap(vx_device_h hdevice, void* host_ptr, uint64_t size) {
 uint64_t vx_svm_dev_addr(vx_device_h hdevice, void* host_ptr) {
   if (!hdevice || !host_ptr) return 0;
   return ((vx_device*)hdevice)->svm_dev_addr(host_ptr);
+}
+
+int vx_svm_fence(vx_device_h hdevice) {
+  if (!hdevice) return -1;
+  DBGPRINT("VX_SVM_FENCE: hdevice=%p\n", hdevice);
+  return ((vx_device*)hdevice)->svm_fence();
 }
 
 } // extern "C"

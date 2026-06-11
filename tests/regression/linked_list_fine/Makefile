@@ -1,7 +1,7 @@
 ROOT_DIR := $(realpath ../../..)
 include $(ROOT_DIR)/config.mk
 
-PROJECT := svm_linked_list
+PROJECT := linked_list_fine
 
 SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
 

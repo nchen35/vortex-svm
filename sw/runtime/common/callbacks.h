@@ -84,6 +84,9 @@ typedef struct {
   // SVM: return device virtual address for a host pointer
   uint64_t (*svm_dev_addr) (vx_device_h hdevice, void* host_ptr);
 
+  // SVM: explicit host-side coherence point for fine-grained buffers
+  int (*svm_fence) (vx_device_h hdevice);
+
 } callbacks_t;
 
 int vx_dev_init(callbacks_t* callbacks);

@@ -252,5 +252,10 @@ extern int vx_dev_init(callbacks_t* callbacks) {
     return ((vx_device*)hdevice)->svm_dev_addr(host_ptr);
   };
 
+  callbacks->svm_fence = [](vx_device_h hdevice)->int {
+    if (nullptr == hdevice) return -1;
+    return ((vx_device*)hdevice)->svm_fence();
+  };
+
   return 0;
 }

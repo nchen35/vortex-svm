@@ -186,3 +186,7 @@ extern int vx_svm_unmap(vx_device_h hdevice, void* host_ptr, uint64_t size) {
 extern uint64_t vx_svm_dev_addr(vx_device_h hdevice, void* host_ptr) {
   return (g_callbacks.svm_dev_addr)(hdevice, host_ptr);
 }
+
+extern int vx_svm_fence(vx_device_h hdevice) {
+  return (g_callbacks.svm_fence)(hdevice);
+}

@@ -131,11 +131,19 @@ int vx_dcr_read(vx_device_h hdevice, uint32_t addr, uint32_t tag, uint32_t* valu
 // query device performance counter
 int vx_mpm_query(vx_device_h hdevice, uint32_t mpm_class, uint32_t addr, uint32_t core_id, uint64_t* value);
 
-////////////////////////////// SVM API (coarse-grained buffer SVM) ////////////
+////////////////////////////// SVM API (buffer SVM: coarse + fine) ////////////
+
+// SVM allocation flag: OR into the `flags` argument of vx_svm_alloc to request a
+// fine-grained buffer. Fine-grained buffers need no map/unmap; coherence is
+// established automatically at kernel launch and completion. Without this flag
+// the buffer is coarse-grained (explicit map/unmap). Distinct from the
+// VX_MEM_READ/WRITE bits, which it is OR'd with.
+#define VX_SVM_FINE_GRAINED         0x10
 
 // Allocate a Shared Virtual Memory buffer.
 // *host_ptr receives a usable C++ host pointer to the buffer.
 // Use vx_svm_dev_addr() to obtain the device-side VA for kernel arguments.
+// Pass VX_SVM_FINE_GRAINED in flags for a fine-grained (map-free) buffer.
 int vx_svm_alloc(vx_device_h hdevice, uint64_t size, int flags, void** host_ptr);
 
 // Release an SVM buffer previously allocated with vx_svm_alloc.
@@ -154,6 +162,14 @@ int vx_svm_unmap(vx_device_h hdevice, void* host_ptr, uint64_t size);
 // Return the device VA corresponding to a host SVM pointer.
 // Simx-specific helper: on real hardware (uint64_t)host_ptr IS the device VA.
 uint64_t vx_svm_dev_addr(vx_device_h hdevice, void* host_ptr);
+
+// Explicit host-side coherence point for fine-grained SVM buffers.
+// Waits for any in-flight kernel, flushes device caches, and refreshes the host
+// view of all fine-grained buffers (device RAM -> host). Optional: coherence is
+// already established automatically at kernel launch/completion, so the common
+// prepare/launch/wait/read pattern does not need this. Provided for explicit
+// non-boundary synchronization. No-op effect on coarse-grained buffers.
+int vx_svm_fence(vx_device_h hdevice);
 
 ////////////////////////////// UTILITY FUNCTIONS //////////////////////////////
 
