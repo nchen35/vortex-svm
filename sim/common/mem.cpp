@@ -467,9 +467,31 @@ uint64_t RAM::size() const {
   return allocated_pages << page_bits_;
 }
 
+void RAM::register_alias(uint64_t base, uint64_t size, uint8_t* host_buf) {
+  aliases_.push_back({base, base + size, host_buf});
+  has_aliases_ = true;
+}
+
+void RAM::unregister_alias(uint64_t base) {
+  for (auto it = aliases_.begin(); it != aliases_.end(); ++it) {
+    if (it->base == base) { aliases_.erase(it); break; }
+  }
+  has_aliases_ = !aliases_.empty();
+}
+
 uint8_t *RAM::get(uint64_t address, bool allocate) const {
   if (capacity_ != 0 && address >= capacity_) {
     throw OutOfRange();
+  }
+  // Shared-backing-store aliasing: if this physical address falls inside a
+  // registered alias region, return a pointer into the external host buffer so
+  // host and simulated device share the exact same bytes (no copy).
+  if (has_aliases_) {
+    for (const auto& a : aliases_) {
+      if (address >= a.base && address < a.end) {
+        return a.host + (address - a.base);
+      }
+    }
   }
   uint32_t page_size   = 1 << page_bits_;
   uint32_t page_offset = address & (page_size - 1);

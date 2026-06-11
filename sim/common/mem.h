@@ -405,6 +405,16 @@ public:
     check_acl_ = enable;
   }
 
+  // ---- Shared-backing-store aliasing (SVM single backing store) ----
+  // Make the physical range [base, base+size) read/write an external host
+  // buffer instead of RAM's own sparse pages. After this, BOTH host-runtime
+  // accesses to this range AND simulated-device accesses (which arrive here as
+  // physical addresses after MMU translation) touch the SAME bytes — i.e. one
+  // backing store shared by host and device, with no copies. Used to implement
+  // fine-grained simultaneous-access SVM. Ranges must not overlap.
+  void register_alias(uint64_t base, uint64_t size, uint8_t* host_buf);
+  void unregister_alias(uint64_t base);
+
 private:
 
   // `allocate=false` returns a pointer into `zero_page_` for unmapped
@@ -433,6 +443,13 @@ private:
 
   ACLManager acl_mngr_;
   bool check_acl_;
+
+  // Aliased physical ranges backed by external host buffers (SVM shared store).
+  // `has_aliases_` is a fast-path guard so non-SVM workloads pay only one branch
+  // in get(). Few regions are ever registered, so a flat vector is fine.
+  struct alias_entry_t { uint64_t base; uint64_t end; uint8_t* host; };
+  std::vector<alias_entry_t> aliases_;
+  bool has_aliases_ = false;
 };
 
 #ifdef VM_ENABLE

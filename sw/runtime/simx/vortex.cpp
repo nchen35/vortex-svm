@@ -30,6 +30,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
 #include <unordered_map>
 
 #include <VX_config.h>
@@ -59,8 +61,11 @@ public:
     uint64_t va;       // device-side virtual address (minted by VMManager)
     uint64_t pa;       // device-side physical address (in global_mem_)
     uint64_t size;     // user-requested size (not page-aligned)
-    uint8_t* host_buf; // host-side copy buffer (malloc'd); equals key
+    uint8_t* host_buf; // host-side buffer (key). For shared regions this IS the
+                       // single backing store (device RAM is aliased to it).
     bool     fine;     // fine-grained: auto-sync at kernel boundaries, no map/unmap
+    bool     shared;   // single backing store (RAM aliased to host_buf); no copies
+    bool     mmapped;  // host_buf was mmap'd at the device VA (host_buf==va)
   };
 
   std::unordered_map<void*, svm_region_t> svm_regions_;
@@ -317,10 +322,11 @@ public:
   // ---- SVM methods (coarse-grained buffer SVM) ----
 
   int svm_alloc(uint64_t size, int flags, void** out_host_ptr) {
-    // Split the fine-grained request bit out of the access flags; the memory
-    // permission machinery only understands VX_MEM_READ/WRITE.
-    bool fine = (flags & VX_SVM_FINE_GRAINED) != 0;
-    int mflags = flags & ~VX_SVM_FINE_GRAINED;
+    // Split the SVM-mode bits out of the access flags; the memory permission
+    // machinery only understands VX_MEM_READ/WRITE.
+    bool shared = (flags & VX_SVM_SHARED) != 0;
+    bool fine   = (flags & VX_SVM_FINE_GRAINED) != 0 || shared; // shared implies fine
+    int mflags  = flags & ~(VX_SVM_FINE_GRAINED | VX_SVM_SHARED);
 
     uint64_t asize = aligned_size(size, MEM_PAGE_SIZE);
     uint64_t pa = 0;
@@ -342,21 +348,50 @@ public:
     });
 #endif
 
-    // Allocate the host-side copy buffer (used by svm_map / svm_unmap, and by
-    // the implicit fine-grained sync at kernel boundaries).
-    uint8_t* host_buf = new (std::nothrow) uint8_t[size]();
-    if (!host_buf) {
+    uint8_t* host_buf = nullptr;
+    bool mmapped = false;
+
+    if (shared) {
+      // SHARED: one backing store. Try to mmap the host buffer at the device VA
+      // so (uintptr_t)host_buf == va ("same address"); fall back to an aligned
+      // allocation otherwise (single backing store still works, sans same-addr).
+      void* p = mmap((void*)(uintptr_t)va, asize, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+      if (p == (void*)(uintptr_t)va) {
+        host_buf = (uint8_t*)p;
+        mmapped = true;
+      } else {
+        if (p != MAP_FAILED)
+          munmap(p, asize); // got a different address; not usable as same-addr
+        host_buf = (uint8_t*)aligned_alloc(MEM_PAGE_SIZE, asize);
+      }
+      if (!host_buf) {
 #ifdef VM_ENABLE
-      vm_mgr_->free_va_mapping(va, asize);
+        vm_mgr_->free_va_mapping(va, asize);
 #endif
-      global_mem_.release(pa);
-      return -1;
+        global_mem_.release(pa);
+        return -1;
+      }
+      memset(host_buf, 0, asize);
+      // Alias the device's physical range to this host buffer: device accesses
+      // to [pa, pa+asize) now read/write host_buf — one shared store.
+      ram_.register_alias(pa, asize, host_buf);
+    } else {
+      // COARSE / plain FINE: separate host copy buffer (synced via copies).
+      host_buf = new (std::nothrow) uint8_t[size]();
+      if (!host_buf) {
+#ifdef VM_ENABLE
+        vm_mgr_->free_va_mapping(va, asize);
+#endif
+        global_mem_.release(pa);
+        return -1;
+      }
     }
 
-    svm_regions_[host_buf] = svm_region_t{va, pa, size, host_buf, fine};
+    svm_regions_[host_buf] = svm_region_t{va, pa, size, host_buf, fine, shared, mmapped};
     *out_host_ptr = host_buf;
-    DBGPRINT("[SVM] svm_alloc: size=0x%lx va=0x%lx pa=0x%lx host_buf=%p fine=%d\n",
-             size, va, pa, (void*)host_buf, (int)fine);
+    DBGPRINT("[SVM] svm_alloc: size=0x%lx va=0x%lx pa=0x%lx host_buf=%p fine=%d shared=%d mmapped=%d\n",
+             size, va, pa, (void*)host_buf, (int)fine, (int)shared, (int)mmapped);
     return 0;
   }
 
@@ -369,12 +404,19 @@ public:
     auto& r = it->second;
     uint64_t asize = aligned_size(r.size, MEM_PAGE_SIZE);
 
+    if (r.shared)
+      ram_.unregister_alias(r.pa);
 #ifdef VM_ENABLE
     vm_mgr_->free_va_mapping(r.va, asize);
 #endif
     this->mem_access(r.pa, asize, 0);
     global_mem_.release(r.pa);
-    delete[] r.host_buf;
+    if (r.shared) {
+      if (r.mmapped) munmap(r.host_buf, asize);
+      else           free(r.host_buf);
+    } else {
+      delete[] r.host_buf;
+    }
     svm_regions_.erase(it);
     DBGPRINT("[SVM] svm_free: host_buf=%p\n", host_ptr);
     return 0;
@@ -449,12 +491,14 @@ public:
   // ---- fine-grained auto-sync (kernel-boundary coherence) ----
 
   // Push every fine-grained host buffer into device RAM. Called at kernel launch
-  // so the device sees the host's latest writes (implicit unmap).
+  // so the device sees the host's latest writes (implicit unmap). SHARED regions
+  // are skipped: their device RAM is aliased to host_buf, so there is nothing to
+  // copy — host writes are already in the one backing store.
   void sync_fine_to_device() {
     bool any = false;
     for (auto& kv : svm_regions_) {
       auto& r = kv.second;
-      if (!r.fine) continue;
+      if (!r.fine || r.shared) continue;
       ram_.enable_acl(false);
       ram_.write(r.host_buf, r.pa, r.size);
       ram_.enable_acl(true);
@@ -466,11 +510,13 @@ public:
 
   // Pull every fine-grained host buffer back from device RAM. Called after the
   // kernel completes so the host sees the device's latest writes (implicit map
-  // READ). Flushes device caches once so written-back data is in RAM.
+  // READ). Flushes device caches once so written-back data is in RAM. SHARED
+  // regions need only the flush (their RAM is aliased to host_buf) — the device's
+  // writes land directly in the one backing store; no copy-back is done.
   void sync_fine_to_host() {
     bool any = false;
     for (auto& kv : svm_regions_) {
-      if (kv.second.fine) { any = true; break; }
+      if (kv.second.fine) { any = true; break; } // fine includes shared
     }
     if (!any)
       return;
@@ -482,7 +528,7 @@ public:
     }
     for (auto& kv : svm_regions_) {
       auto& r = kv.second;
-      if (!r.fine) continue;
+      if (!r.fine || r.shared) continue;
       ram_.enable_acl(false);
       ram_.read(r.host_buf, r.pa, r.size);
       ram_.enable_acl(true);

@@ -140,10 +140,22 @@ int vx_mpm_query(vx_device_h hdevice, uint32_t mpm_class, uint32_t addr, uint32_
 // VX_MEM_READ/WRITE bits, which it is OR'd with.
 #define VX_SVM_FINE_GRAINED         0x10
 
+// SVM allocation flag: OR into `flags` to request a SHARED (single-backing-store)
+// buffer. Unlike plain fine-grained (which keeps a host copy and syncs whole
+// buffers at kernel boundaries), a shared buffer has ONE backing store: the
+// device's simulated RAM is aliased to the host buffer, so host and device read/
+// write the same bytes with no copy. This enables fine-grained *simultaneous
+// access*: the host and device may modify DIFFERENT bytes of the same buffer
+// concurrently (no atomics; same-byte/cross-read sharing still needs atomics and
+// is unsupported). Implies fine-grained (no map/unmap). When the OS permits, the
+// host pointer is mmap'd at the device VA so (uintptr_t)host_ptr == device VA.
+#define VX_SVM_SHARED               0x20
+
 // Allocate a Shared Virtual Memory buffer.
 // *host_ptr receives a usable C++ host pointer to the buffer.
 // Use vx_svm_dev_addr() to obtain the device-side VA for kernel arguments.
-// Pass VX_SVM_FINE_GRAINED in flags for a fine-grained (map-free) buffer.
+// Pass VX_SVM_FINE_GRAINED for a fine-grained (map-free) buffer, or
+// VX_SVM_SHARED for a single-backing-store buffer supporting simultaneous access.
 int vx_svm_alloc(vx_device_h hdevice, uint64_t size, int flags, void** host_ptr);
 
 // Release an SVM buffer previously allocated with vx_svm_alloc.
